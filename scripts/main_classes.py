@@ -7,6 +7,10 @@ import matplotlib.pyplot as plt
 import neo
 from neo.io import Spike2IO
 from scipy import signal
+from neo import Block
+import scipy.stats as stats
+from multiprocessing import Pool
+
 
 
 def find_smr_files(directory: str) -> List[str]:
@@ -15,19 +19,48 @@ def find_smr_files(directory: str) -> List[str]:
     """
     # Expand the '~' to the full home directory path
     expanded_directory = os.path.expanduser(directory)
-    return glob(f"{expanded_directory}/**/*.smr", recursive=True)
+    file_list = glob(f"{expanded_directory}/**/*.smr", recursive=True)
+    file_list.sort()
+    return file_list
 
-def load_smr_file(file_name: str) -> neo.core.Block:
+def load_smr_file(file_name: str) -> neo.Block:
     """
     Load a .smr file using Neo.
     """
     reader = Spike2IO(file_name)
     return reader.read_block()
 
-def plot_channels(data: np.ndarray, time: np.ndarray) -> None:
-    fig, axes = plt.subplots(len(data), 1, figsize=(10, 6), sharex=True)
-    for i, channel in enumerate(data):
+def band_pass_filter(lowcut: float, highcut: float, fs: float, order: int = 1): #-> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create a bandpass filter using Butterworth design.
+    """
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    if isinstance(low, float) and isinstance(high, float):
+        b, a = signal.butter(order, [low, high], btype='bandpass')
+        return b, a
+    return np.array([]), np.array([])
+
+def lfp_processing(trace: np.ndarray) -> dict:
+        trace_dict = {"trace": trace}
+        hilbert_trace = signal.hilbert(trace_dict["trace"], axis=1)
+        trace_dict.update(amplitude = np.abs(hilbert_trace))
+        trace_dict.update(phase = np.angle(hilbert_trace))
+        return trace_dict
+
+def plot_channels(data: np.ndarray|dict, time: np.ndarray) -> None:
+    if isinstance(data, dict):
+        trace_data = data["trace"]
+    else:
+        trace_data = data
+    fig, axes = plt.subplots(len(trace_data), 1, figsize=(10, 6), sharex=True)
+    for i, channel in enumerate(trace_data):
         axes[i].plot(time, channel)
+        if isinstance(data, dict) and "amplitude" in data:
+            axes[i].plot(time, data["amplitude"][i], color='orange', label='Amplitude')
+            if "sws" in data:
+                axes[i].scatter(data["sws"]["peak_time"][i], data["sws"]["peak_amplitude"][i], color='red', marker='.')
         axes[i].set_ylabel(f'Channel {i + 1} (mV)')
     axes[-1].set_xlabel('Time (s)')
     fig.tight_layout()
@@ -62,33 +95,22 @@ def combine_power_spectra(power_dfs: List[pd.DataFrame]) -> pd.DataFrame:
     combined = pd.concat(power_dfs, ignore_index=True)
     return combined
 
-class DataSet:
-    def __init__(self, directory: str):
-        self.directory = directory
-        self.smr_files = self._get_smr_files()
-        self.power_data: pd.DataFrame | None = None
-        self.gamma_data: pd.DataFrame | None = None
-
-    def _get_smr_files(self):
-        return find_smr_files(self.directory)
-
-
 class TraceData:
-    def __init__(self, file_name: str, notch: float|None = None) -> None:
+    def __init__(self, file_name: str, notch: float|None = None, downsampling_frequency: float|None = None) -> None:
         self.time: np.ndarray = np.array([])
         self.trace: np.ndarray = np.array([])
         self.sampling_rate: float | None = None
         self.time_unit: str = 's'
         self.trace_unit: str = 'mV'
-        self.ripple_trace: np.ndarray | None = None
+        self.ripple_trace: dict | None = None
+        self.gamma_trace: dict | None = None
+        self.sharp_wave_trace: dict | None = None
         self.notch: float | None = None
         self.file_name: str = file_name
         self.channel_count: int = 0
 
         self.date = self.file_name.split('/')[-1].split("_")[0]  # Get the date from the file name
         self.recording = self.file_name.split('/')[-1].split("_")[1].removesuffix(".smr")  # Get the recording from the file name
-
-
         block = load_smr_file(file_name)
         if block.segments:
             segment = block.segments[0]
@@ -102,10 +124,12 @@ class TraceData:
                 self.channel_count = self.trace.shape[0]
             if isinstance(notch, (int, float)) and notch > 0 and self.sampling_rate is not None:
                 self.notch = notch
-                b, a = signal.iirnotch(notch, Q=70, fs=self.sampling_rate)
+                b, a = signal.iirnotch(notch, Q=40, fs=self.sampling_rate)
                 self.trace = signal.filtfilt(b, a, self.trace, axis=1)
             else:
                 print("No notch filter applied or invalid notch frequency provided.")
+        if downsampling_frequency is not None:
+            self.downsample(downsampling_frequency)
 
     def downsample(self, frequency: float) -> None:
         """
@@ -128,7 +152,7 @@ class TraceData:
         self.time = self.time[::factor]
         self.sampling_rate = frequency
 
-    def ripple_filter(self, lowcut: float = 80.0, highcut: float = 250.0, order: int = 4):
+    def ripple_filter(self, lowcut: float = 150.0, highcut: float = 250.0, order: int = 1):
         """
         Apply a bandpass filter to the trace data to isolate ripple frequencies.
         """
@@ -136,14 +160,12 @@ class TraceData:
             raise ValueError("Trace data or time data is not available. Cannot filter.")
         if self.sampling_rate is None:
             raise ValueError("Sampling rate is not set. Cannot filter.")
-        
-        nyquist = 0.5 * self.sampling_rate
-        low = lowcut / nyquist
-        high = highcut / nyquist
-        b, a = signal.butter(order, [low, high], btype='bandpass', analog=True)
-        self.ripple_trace = signal.filtfilt(b, a, self.trace, axis=1)
+        b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
+
+        self.ripple_trace = lfp_processing(signal.filtfilt(b, a, self.trace, axis=1))
+
     
-    def gamma_filter(self, lowcut: float = 30.0, highcut: float = 90.0, order: int = 4):
+    def gamma_filter(self, lowcut: float = 30.0, highcut: float = 90.0, order: int = 1):
         """
         Apply a bandpass filter to the trace data to isolate gamma frequencies.
         """
@@ -151,15 +173,30 @@ class TraceData:
             raise ValueError("Trace data or time data is not available. Cannot filter.")
         if self.sampling_rate is None:
             raise ValueError("Sampling rate is not set. Cannot filter.")
+        b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
+        self.gamma_trace = lfp_processing(signal.filtfilt(b, a, self.trace, axis=1))
 
-        nyquist = 0.5 * self.sampling_rate
-        low = lowcut / nyquist
-        high = highcut / nyquist
-        b, a = signal.butter(order, [low, high], btype='bandpass', analog=True)
-        self.gamma_trace = signal.filtfilt(b, a, self.trace, axis=1)
+    def sharp_wave_filter(self, lowcut: float = 5.0, highcut: float = 40.0, order: int = 1):
+        """
+        Apply a bandpass filter to the trace data to isolate sharp wave frequencies.
+        """
+        if self.trace is None or self.time is None:
+            raise ValueError("Trace data or time data is not available. Cannot filter.")
+        if self.sampling_rate is None:
+            raise ValueError("Sampling rate is not set. Cannot filter.")
+        b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
+        self.sharp_wave_trace = lfp_processing(signal.filtfilt(b, a, self.trace, axis=1))
+        zscore_sw = stats.zscore(self.sharp_wave_trace["amplitude"], axis=1)
+        # find peaks in channels with minimum of 50 ms inbetween peaks and minimum height of 3
+        #      
+        peaks_results = [signal.find_peaks(channel_trace, height=3, distance=self.sampling_rate // 20) for channel_trace in zscore_sw]
+        peaks, _ = zip(*peaks_results)
+        self.sharp_wave_trace["sws"] = {"index": peaks,
+                                        "peak_time": [self.time[p] for p in peaks],
+                                        "peak_amplitude": [self.sharp_wave_trace["amplitude"][i][p] for i, p in enumerate(peaks)]}
 
     def plot_ripple(self) -> None:
-        """20
+        """
         Plot the ripple filtered trace data.
         """
         if hasattr(self, 'ripple_trace') and self.ripple_trace is not None and self.time is not None:
@@ -172,6 +209,40 @@ class TraceData:
         if hasattr(self, 'gamma_trace') and self.gamma_trace is not None and self.time is not None:
             plot_channels(self.gamma_trace, self.time)
 
+    def plot_sharp_wave(self) -> None:
+        """
+        Plot the sharp wave filtered trace data.
+        """
+        if hasattr(self, 'sharp_wave_trace') and self.sharp_wave_trace is not None and self.time is not None:
+            plot_channels(self.sharp_wave_trace, self.time)
+
+    def extract_sws(self, window_size: float = 100.0) -> List[dict]:
+        """
+        Extract sharp wave data from the sharp wave trace.
+        """
+        if not hasattr(self, 'sharp_wave_trace') or self.sharp_wave_trace is None:
+            raise ValueError("Sharp wave trace is not available. Cannot extract SWS.")
+        if "sws" not in self.sharp_wave_trace:
+            raise ValueError("SWS data is not available in the sharp wave trace.")
+        def get_cutout(trace, ripple_trace, index, width):
+            if hasattr(self, 'sharp_wave_trace') and self.sharp_wave_trace is not None:
+                if "amplitude" not in self.sharp_wave_trace:
+                    raise ValueError("Amplitude data is not available in the sharp wave trace.")
+                if len(self.sharp_wave_trace["amplitude"]) == 0:
+                    raise ValueError("Amplitude data is empty. Cannot extract SWS.")
+            sws_array = np.zeros((len(index), width-1))
+            ripple_array = np.zeros((len(index), width-1))
+            for i, idx in enumerate(index):
+                sws_array[i] = trace[idx - width // 2: idx + width // 2]
+                ripple_array[i] = ripple_trace[idx - width // 2: idx + width // 2]
+            return {"sws": sws_array, "ripple": ripple_array}
+        if self.sampling_rate is None:
+            raise ValueError("Sampling rate is not set. Cannot extract SWS.")
+        width = int(window_size * self.sampling_rate // 1000)  # Convert window size from ms to samples
+        if self.ripple_trace is None or "trace" not in self.ripple_trace:
+            raise ValueError("Ripple trace is not available. Cannot extract SWS.")
+        return [get_cutout(self.trace[channel_index], self.ripple_trace["trace"][channel_index], index, width) for channel_index, index in enumerate(self.sharp_wave_trace["sws"]["index"])]
+
     def plot(self) -> None:
         """
         Plot the trace data.
@@ -179,7 +250,8 @@ class TraceData:
         if len(self.trace) == 0 or len(self.time) == 0:
             raise ValueError("Trace data or time data is not available. Cannot plot.")
         plot_channels(self.trace, self.time)
-        
+
+
 class TraceView:
     def __init__(self, data: TraceData, window_start: float, window_size: float):
         self.window_start = window_start
@@ -215,7 +287,7 @@ class TraceView:
         
         self.power_df = pd.DataFrame(columns=["Frequency", "Power", "SegmentTime", "Channel"])
         for i, channel in enumerate(self.trace):
-            freqs, psd = signal.welch(channel, fs=self.sampling_rate, nperseg=nperseg, average='mean', scaling='spectrum', axis=1)
+            freqs, psd = signal.welch(channel, fs=self.sampling_rate, nperseg=nperseg, average='mean', scaling='density', axis=1)
             psd_df = pd.concat([
                 pd.DataFrame({
                     "Frequency": freqs,
@@ -225,6 +297,7 @@ class TraceView:
                     "Date": self.date,
                     "Recording": self.recording,
                     "FileName": self.file_name,
+                    "SegmentTimeFile": self.time[j, 0],
                     "Index": j
                 })
                 for j, power_spec in enumerate(psd)
@@ -245,6 +318,140 @@ class TraceView:
             raise ValueError("Power data is not available in one of the TraceView instances.")
         self.power_df["SegmentTime"] += trace_view.power_df["SegmentTime"].max() + self.window_size
         self.power_df["Index"] += trace_view.power_df["Index"].max() + 1
+    
+    def merge_concentration_data(self, concentration_data: pd.DataFrame) -> None:
+        """
+        Merge concentration data with the power DataFrame.
+        """
+
+        if self.power_df is None:
+            raise ValueError("Power data has not been calculated. Call calc_power_spectrum() first.")
+        if not isinstance(concentration_data, pd.DataFrame):
+            raise ValueError("Concentration data must be a pandas DataFrame.")
+
+        concentration_data = concentration_data[concentration_data["Recording_file"].str.contains(self.file_name.split("/")[-1])]
+        # assign kainate concentration to the power_df when time_wash-in is later or equal the SegmentTimeFile 
+        concentration_df = concentration_data[concentration_data["Recording_file"].str.contains(self.file_name.split("/")[-1])].copy()
+        # get column which contain string washin
+        wash_in_col = concentration_data.columns[["wash" in col.lower() for col in concentration_data.columns]][0]
+        concentration_df.sort_values(by=wash_in_col, inplace=True, ascending=False, ignore_index=True)  # Sort by time_wash-in in descending order
+        last_time_point = self.power_df["SegmentTimeFile"].max()  # Initialize last_time_point with the start time of the first trace
+        self.power_df["Kainate_concentration"] = 0
+        for i, row in concentration_df.iterrows():
+            time_wash_in = row[wash_in_col]
+            kainate_conc = row["Kainate_concentration"]
+            if i == 0:
+                edge_include = "both"
+            else:
+                edge_include = "left"
+            self.power_df.loc[self.power_df["SegmentTimeFile"].between(
+                time_wash_in, last_time_point, inclusive=edge_include), "Kainate_concentration"] = kainate_conc  # Set the concentration for the time range
+            last_time_point = time_wash_in
+
+
+class DataSet:
+    def __init__(self, directory: str):
+        self.directory = directory
+        self.smr_files = self._get_smr_files()
+        self.power_data: pd.DataFrame | None = None
+        self.gamma_data: pd.DataFrame | None = None
+
+    def _get_smr_files(self):
+        return find_smr_files(self.directory)
+
+    def load_trace_data(self, notch: float | None = None, downsampling_frequency: float | None = None) -> None:
+        if not self.smr_files:
+            print("No .smr files found.")
+            return None
+        self.trace_data_raw = [TraceData(file, notch=notch, downsampling_frequency=downsampling_frequency) for file in self.smr_files]
+
+    def to_trace_view(self, window_start: float = 0, window_size: float = 60, force: bool = False) -> List | None:
+        """
+        Convert the loaded trace data into TraceView objects.
+        """
+        if hasattr(self, 'trace_data') and isinstance(self.trace_data[0], TraceView) and hasattr(self, 'trace_data_raw'):
+            if force:
+                print("Converting trace data to TraceView objects...")
+                self.trace_data = [TraceView(data, window_start, window_size) for data in self.trace_data_raw if isinstance(data, TraceData)]
+            else:
+                print("Trace data has already been converted to TraceView objects.")
+                return self.trace_data
+        if not hasattr(self, 'trace_data_raw'):
+            raise ValueError("Trace data has not been loaded. Call load_trace_data() first.")
+        elif isinstance(self.trace_data_raw[0], TraceData):
+            self.trace_data = [TraceView(data, window_start, window_size) for data in self.trace_data_raw if isinstance(data, TraceData)]
+            return None
+    
+    def combine_power_spectra(self, nperseg=1250) -> pd.DataFrame:
+        """
+        Combine power spectra from all TraceView objects into a single DataFrame.
+        """
+        if not hasattr(self, 'trace_data'):
+            raise ValueError("Trace data has not been loaded. Call load_trace_data() first.")
+        if not all(isinstance(tv, TraceView) for tv in self.trace_data):
+            raise ValueError("All trace data must be converted to TraceView objects first.")
+        
+        last_group = ""
+        last_tv = None
+        for tv in self.trace_data:
+            if isinstance(tv, TraceView):
+                current_group = f"{tv.date}_{tv.recording}"
+                tv.calc_power_spectrum(nperseg)  # Ensure power spectrum is calculated
+                if current_group == last_group and last_tv is not None:
+                    print(f"Continuing with {current_group}...")
+                    tv.update_segment_time(last_tv)
+                last_group = current_group
+                last_tv = tv
+        return pd.concat([tv.power_df for tv in self.trace_data if isinstance(tv, TraceView) and hasattr(tv, 'power_df')], ignore_index=True)
+
+    def add_concentration_table(self, file_path: str) -> None:
+        """
+        Add a concentration table to the dataset.
+        """
+        concentration_data = pd.read_csv(file_path, sep=",")
+        concentration_data["Date"] = concentration_data["Recording_file"].apply(lambda x: x.split("_")[0])
+        concentration_data["Recording"] = concentration_data["Recording_file"].apply(lambda x: x.split("_")[1].removesuffix(".smr"))
+        self.concentration_data = concentration_data
+    
+    def merge_concentration_data(self):
+        """
+        Merge concentration data with power data.
+        """
+        if not hasattr(self, "trace_data"):
+            raise ValueError("Trace data has not been loaded. Call load_trace_data() first.")
+        if not hasattr(self, 'concentration_data'):
+            raise ValueError("Concentration data has not been added. Call add_concentration_table() first.")
+
+        for tv in self.trace_data:
+            if not hasattr(tv, 'power_df'):
+                raise ValueError("Power data has not been calculated. Call combine_power_spectra() first.")
+            if isinstance(tv, TraceView):
+                tv.merge_concentration_data(self.concentration_data)
+    
+    def return_power_df(self) -> pd.DataFrame:
+        """
+        Return the combined power DataFrame from all TraceView objects.
+        """
+        if not hasattr(self, 'trace_data'):
+            raise ValueError("Trace data has not been loaded. Call load_trace_data() first.")
+
+        return pd.concat([tv.power_df for tv in self.trace_data if hasattr(tv, 'power_df') and isinstance(tv, TraceView)], ignore_index=True)
+
+    def apply_fun_to_view(self, fun):
+        for tv in self.trace_data:
+            fun(tv)
+    
+    def apply_fun_to_raw_data(self, fun):
+        """
+        Apply a function to the raw trace data.
+        """
+        if not hasattr(self, 'trace_data_raw'):
+            raise ValueError("Trace data has not been loaded. Call load_trace_data() first.")
+
+        for tv in self.trace_data_raw:
+            fun(tv)
+
+
 
 # calculate the full width at half maximum (FWHM) of the peak
 def calculate_fwhm(df: pd.DataFrame, peak: int) -> np.ndarray:
@@ -261,52 +468,3 @@ def calculate_fwhm(df: pd.DataFrame, peak: int) -> np.ndarray:
     left_idx = np.where(df["Power"].values[:peak][::-1] < half_max)[0][0]
     right_idx = np.where(df["Power"].values[peak:] < half_max)[0][0]
     return df["Frequency"].values[right_idx] - df["Frequency"].values[left_idx]
-
-
-
-file_names = find_smr_files("data/")  # Example usage, replace with your directory
-data_set = DataSet("data/")
-data_set.smr_files
-trace_data = TraceData(file_names[0], notch=50)  # Example usage, replace with your file name and notch frequency
-trace_data.downsample(2500)  # Downsample to 1000 Hz
-trace_data1 = TraceData(file_names[1], notch=50)  # Load another trace data file
-trace_data1.downsample(2500)  # Downsample to 1000 Hz
-trace_view = TraceView(trace_data, window_start=0, window_size=60)  # Create a view for the first 60 seconds
-trace_view.calc_power_spectrum(nperseg=5000)  # Calculate power spectrum with nperseg of 2048
-trace_view1 = TraceView(trace_data1, window_start=0, window_size=60)  # Create a view for the first 60 seconds
-trace_view1.calc_power_spectrum(nperseg=5000)  # Calculate power spectrum with nperseg of 2048
-
-
-trace_view1.update_segment_time(trace_view)  # Update segment time with the first trace view
-trace_view1.power_df
-trace_view.power_df
-
-plot_power_spectrum(combine_power_spectra([trace_view.power_df, trace_view1.power_df]))
-
-trace_data.plot()
-trace_data.ripple_filter()  # Apply ripple filter
-trace_data.plot()  # Plot the filtered trace data
-trace_data.plot_ripple()  # Plot the ripple filtered trace data
-trace_data.gamma_filter()  # Apply gamma filter
-trace_data.plot_gamma()  # Plot the gamma filtered trace data
-
-first_df = trace_view.power_df[trace_view.power_df["Channel"]==1 & (trace_view.power_df["Index"] ==57)]  # Display first 10 rows of power data for channel 1 and segment time 0
-first_df = trace_view.power_df[trace_view.power_df["Channel"]==2]  # Display first 10 rows of power data for channel 1 and segment time 0
-
-# find peaks in the power spectrum of channel 1 at segment time 0 between 10 and 60 Hz
-peaks, _ = signal.find_peaks(first_df[first_df["Frequency"].between(5, 90)]["Power"], height=0.00001, distance=20)
-
-
-max_peak = peaks[first_df[first_df["Frequency"].between(5, 90)]["Power"].values[peaks].argmax()]
-
-
-
-fwhm = calculate_fwhm(first_df, peaks[0])
-# frequency of peaks
-print("Peak Frequencies:", first_df["Frequency"][peaks].values)
-
-plot_power_spectrum(first_df, xlim=(0,200), alpha=1)
-plot_power_spectrum(trace_view1.power_df, xlim=(0,200), alpha=1)
-
-first_df["Frequency"][peaks]
-
