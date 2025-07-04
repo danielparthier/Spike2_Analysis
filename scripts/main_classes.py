@@ -474,6 +474,8 @@ class DataSet:
      #   from copy import deepcopy
         power_df_out = pd.DataFrame()
         bar = Bar('Processing files...', max=len(self.smr_files), suffix='%(percent)d%%')
+        last_group = ""
+        last_tv = None
         for file_i, file_name in enumerate(self.smr_files):
             # make progressbar in terminal
             sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file_name}")
@@ -481,15 +483,24 @@ class DataSet:
             tv = TraceView(TraceData(file_name, notch=notch,
                                     downsampling_frequency=downsampling_frequency),
                                     window_start, window_size)
-            tv.calc_power_spectrum()
-            if self.concentration_data is not None and isinstance(self.concentration_data, pd.DataFrame):
-                tv.merge_concentration_data(self.concentration_data)
+            current_group = f"{tv.date}_{tv.recording}"
+            tv.calc_power_spectrum(nperseg)  # Ensure power spectrum is calculated
+            if current_group == last_group and last_tv is not None:
+                tv.update_segment_time(last_tv)
+            
             if file_i == 0:
                 last_tv = tv
                 power_df_out = tv.power_df
             else:
                 tv.update_segment_time(last_tv)
                 power_df_out = pd.concat([power_df_out, tv.power_df], ignore_index=True)
+            
+            last_group = current_group
+            last_tv = tv
+
+            if self.concentration_data is not None and isinstance(self.concentration_data, pd.DataFrame):
+                tv.merge_concentration_data(self.concentration_data)
+
             bar.next()
         bar.finish()
         return power_df_out

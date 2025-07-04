@@ -3,11 +3,11 @@ from scipy import signal
 
 data_set = DataSet("data/")
 data_set.add_concentration_table("data/Epileptiform activity/WashinTime.csv")
-data_set.smr_files = data_set.smr_files
+data_set.smr_files = data_set.smr_files[0:6]
 power_df = data_set.power_df_only()
 
 power_df.groupby(["Date", "Recording"])["SegmentTime"].max()
-
+dt = power_df
 
 
 # gamma power
