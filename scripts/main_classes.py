@@ -467,7 +467,8 @@ class DataSet:
                     notch: float | None = 50,
                     downsampling_frequency: float | None = 1250,
                     window_start: float | None = 0,
-                    window_size: float | None = 60) -> pd.DataFrame:
+                    window_size: float | None = 60,
+                    nperseg: int | None = None) -> pd.DataFrame:
         """
         Return only the power DataFrame from the TraceView objects.
         """
@@ -484,6 +485,8 @@ class DataSet:
                                     downsampling_frequency=downsampling_frequency),
                                     window_start, window_size)
             current_group = f"{tv.date}_{tv.recording}"
+            if nperseg is None:
+                nperseg = int(tv.sampling_rate)
             tv.calc_power_spectrum(nperseg)  # Ensure power spectrum is calculated
             if current_group == last_group and last_tv is not None:
                 tv.update_segment_time(last_tv)
