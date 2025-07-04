@@ -3,18 +3,17 @@ from scipy import signal
 
 data_set = DataSet("data/")
 data_set.add_concentration_table("data/Epileptiform activity/WashinTime.csv")
-data_set.smr_files = data_set.smr_files[0:6]
-power_df = data_set.power_df_only()
+data_set.smr_files = data_set.smr_files
+dt = data_set.power_df_only()
 
-power_df.groupby(["Date", "Recording"])["SegmentTime"].max()
-dt = power_df
-
+dt.groupby(["Date", "Recording"])["SegmentTime"].max()
 
 # gamma power
 dt_gamma = pd.merge(dt.loc[dt[dt["Frequency"].between(1, 5)].groupby(["Channel", "Index", "Recording", "SegmentTime", "Date", "FileName", "SegmentTimeFile", "Kainate_concentration"])["Power"].idxmax()],
                    dt.loc[dt[dt["Frequency"].between(1, 90)].groupby(["Channel", "Index", "Recording", "SegmentTime", "Date", "FileName", "SegmentTimeFile", "Kainate_concentration"])["Power"].idxmax()],
                    on=["Channel", "Index", "Recording", "SegmentTime", "Date", "FileName", "SegmentTimeFile", "Kainate_concentration"], suffixes=("_low", "_high"))
-dt_gamma["normalised_gamma"] = dt_gamma["Power_high"] / dt_gamma["Power_low"]  # Normalize gamma power by dividing by the low frequency power
+# add column with "normalised_gamma"
+dt_gamma["normalised_gamma"] = dt_gamma["Power_high"] / dt_gamma["Power_low"]  
 
 # get the power for the last 10 minutes of each Channel, Date, Recording, Kainate_concentration
 dt_kainate_power = dt_gamma.groupby(["Channel", "Date", "Recording", "Kainate_concentration"])["normalised_gamma"].apply(lambda x: x.tail(10)).groupby(["Channel", "Date", "Recording", "Kainate_concentration"]).mean().reset_index()  # Calculate the mean normalized gamma power for the last 10 minutes of each Channel, Date, Recording, Kainate_concentration
@@ -29,7 +28,7 @@ for (channel, date, recording), group in dt_kainate_power_raw.groupby(["Channel"
 plt.xlabel("Kainate Concentration (mM)")
 plt.ylabel("Power (uV^2/Hz)")
 plt.title("Power vs Kainate Concentration")
-plt.legend()
+#plt.legend()
 plt.grid()
 plt.show()
 
