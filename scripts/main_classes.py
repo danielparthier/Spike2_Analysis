@@ -9,7 +9,8 @@ from neo.io import Spike2IO
 from scipy import signal
 from neo import Block
 import scipy.stats as stats
-from multiprocessing import Pool
+from progress.bar import Bar
+import sys
 
 
 
@@ -363,7 +364,18 @@ class DataSet:
         if not self.smr_files:
             print("No .smr files found.")
             return None
-        self.trace_data_raw = [TraceData(file, notch=notch, downsampling_frequency=downsampling_frequency) for file in self.smr_files]
+        bar = Bar('Loading files...', max=len(self.smr_files), suffix='%(percent)d%%')
+        raw_list = []
+        for file in self.smr_files:
+            if not os.path.exists(file):
+                raise FileNotFoundError(f"File {file} does not exist.")
+            raw_list.append(TraceData(file, notch=notch, downsampling_frequency=downsampling_frequency))
+            sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file_name}")
+            sys.stdout.flush()
+            bar.next()
+        self.trace_data_raw = raw_list
+        bar.finish()
+        
 
     def to_trace_view(self, window_start: float = 0, window_size: float = 60, force: bool = False) -> List | None:
         """
@@ -450,6 +462,37 @@ class DataSet:
 
         for tv in self.trace_data_raw:
             fun(tv)
+
+    def power_df_only(self,
+                    notch: float | None = 50,
+                    downsampling_frequency: float | None = 1250,
+                    window_start: float | None = 0,
+                    window_size: float | None = 60) -> pd.DataFrame:
+        """
+        Return only the power DataFrame from the TraceView objects.
+        """
+     #   from copy import deepcopy
+        power_df_out = pd.DataFrame()
+        bar = Bar('Processing files...', max=len(self.smr_files), suffix='%(percent)d%%')
+        for file_i, file_name in enumerate(self.smr_files):
+            # make progressbar in terminal
+            sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file_name}")
+            sys.stdout.flush()
+            tv = TraceView(TraceData(file_name, notch=notch,
+                                    downsampling_frequency=downsampling_frequency),
+                                    window_start, window_size)
+            tv.calc_power_spectrum()
+            if self.concentration_data is not None and isinstance(self.concentration_data, pd.DataFrame):
+                tv.merge_concentration_data(self.concentration_data)
+            if file_i == 0:
+                last_tv = tv
+                power_df_out = tv.power_df
+            else:
+                tv.update_segment_time(last_tv)
+                power_df_out = pd.concat([power_df_out, tv.power_df], ignore_index=True)
+            bar.next()
+        bar.finish()
+        return power_df_out
 
 
 

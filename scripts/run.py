@@ -3,17 +3,11 @@ from scipy import signal
 
 data_set = DataSet("data/")
 data_set.add_concentration_table("data/Epileptiform activity/WashinTime.csv")
-#data_set.smr_files = data_set.smr_files[0:2]
-data_set.load_trace_data(notch=50, downsampling_frequency=1250)  # Load trace data with a notch filter at 50 Hz
-data_set.to_trace_view(window_start=0, window_size=60)  # Create TraceView objects for the first 60 seconds
-data_set.combine_power_spectra()  # Combine power spectra from all TraceView objects
-data_set.merge_concentration_data()  # Merge concentration data with power data
-dt = data_set.return_power_df()  # Return the combined power DataFrame from all TraceView objects
+data_set.smr_files = data_set.smr_files
+power_df = data_set.power_df_only()
 
-def fun_filter(td: TraceData):
-    td.ripple_filter(lowcut=150, highcut=250, order=1)  # Apply ripple filter to each TraceView object
-    td.gamma_filter(lowcut=.30, highcut=90, order=1)  # Apply gamma filter to each TraceView object
-    td.sharp_wave_filter(lowcut=5, highcut=40, order=1)  # Apply sharp wave filter to each TraceView object
+power_df.groupby(["Date", "Recording"])["SegmentTime"].max()
+
 
 
 # gamma power
@@ -47,7 +41,7 @@ for (channel, date, recording), group in dt_kainate_power.groupby(["Channel", "D
 plt.xlabel("Kainate Concentration (mM)")
 plt.ylabel("Normalized Gamma Power")
 plt.title("Normalized Gamma Power vs Kainate Concentration")
-plt.legend()
+#plt.legend()
 plt.grid()
 plt.show()
 
@@ -96,6 +90,24 @@ plt.ylabel("Frequency (Hz)")
 plt.title("Frequency over Segment Time")
 plt.grid()
 plt.show()
+
+
+
+
+
+### requires to load files --> memory heavy and only if necessary
+data_set.load_trace_data(notch=50, downsampling_frequency=1250)  # Load trace data with a notch filter at 50 Hz
+data_set.to_trace_view(window_start=0, window_size=60)  # Create TraceView objects for the first 60 seconds
+data_set.combine_power_spectra()  # Combine power spectra from all TraceView objects
+data_set.merge_concentration_data()  # Merge concentration data with power data
+dt = data_set.return_power_df()  # Return the combined power DataFrame from all TraceView objects
+
+
+def fun_filter(td: TraceData):
+    td.ripple_filter(lowcut=150, highcut=250, order=1)  # Apply ripple filter to each TraceView object
+    td.gamma_filter(lowcut=.30, highcut=90, order=1)  # Apply gamma filter to each TraceView object
+    td.sharp_wave_filter(lowcut=5, highcut=40, order=1)  # Apply sharp wave filter to each TraceView object
+
 
 
 #####
