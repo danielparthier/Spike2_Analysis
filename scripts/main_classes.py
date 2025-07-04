@@ -333,6 +333,10 @@ class TraceView:
         concentration_data = concentration_data[concentration_data["Recording_file"].str.contains(self.file_name.split("/")[-1])]
         # assign kainate concentration to the power_df when time_wash-in is later or equal the SegmentTimeFile 
         concentration_df = concentration_data[concentration_data["Recording_file"].str.contains(self.file_name.split("/")[-1])].copy()
+        if concentration_df.empty:
+            print(f"No concentration data found for {self.file_name}. Skipping concentration merge.")
+            self.power_df["Kainate_concentration"] = np.nan
+            return
         # get column which contain string washin
         wash_in_col = concentration_data.columns[["wash" in col.lower() for col in concentration_data.columns]][0]
         concentration_df.sort_values(by=wash_in_col, inplace=True, ascending=False, ignore_index=True)  # Sort by time_wash-in in descending order
@@ -366,11 +370,11 @@ class DataSet:
             return None
         bar = Bar('Loading files...', max=len(self.smr_files), suffix='%(percent)d%%')
         raw_list = []
-        for file in self.smr_files:
+        for file_i, file in enumerate(self.smr_files):
             if not os.path.exists(file):
                 raise FileNotFoundError(f"File {file} does not exist.")
             raw_list.append(TraceData(file, notch=notch, downsampling_frequency=downsampling_frequency))
-            sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file_name}")
+            sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file}")
             sys.stdout.flush()
             bar.next()
         self.trace_data_raw = raw_list
