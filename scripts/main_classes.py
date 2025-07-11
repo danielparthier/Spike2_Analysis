@@ -10,7 +10,11 @@ from scipy import signal
 from neo import Block
 import scipy.stats as stats
 from progress.bar import Bar
+from copy import deepcopy
 import sys
+import pywt
+from multiprocessing import Pool
+
 
 
 
@@ -39,16 +43,20 @@ def band_pass_filter(lowcut: float, highcut: float, fs: float, order: int = 1): 
     low = lowcut / nyquist
     high = highcut / nyquist
     if isinstance(low, float) and isinstance(high, float):
-        b, a = signal.butter(order, [low, high], btype='bandpass')
+        b, a = signal.butter(order, [low, high], btype='bandpass')  # pyright: ignore[reportGeneralTypeIssues]
         return b, a
     return np.array([]), np.array([])
 
 def lfp_processing(trace: np.ndarray) -> dict:
-        trace_dict = {"trace": trace}
+    trace_dict = {"trace": trace}
+    if trace.ndim == 1:
+        hilbert_trace = signal.hilbert(trace_dict["trace"])
+    else:
         hilbert_trace = signal.hilbert(trace_dict["trace"], axis=1)
-        trace_dict.update(amplitude = np.abs(hilbert_trace))
-        trace_dict.update(phase = np.angle(hilbert_trace))
-        return trace_dict
+    trace_dict.update(amplitude = np.abs(hilbert_trace))
+    trace_dict.update(phase = np.angle(hilbert_trace))
+    return trace_dict
+
 
 def plot_channels(data: np.ndarray|dict, time: np.ndarray) -> None:
     if isinstance(data, dict):
@@ -95,6 +103,236 @@ def combine_power_spectra(power_dfs: List[pd.DataFrame]) -> pd.DataFrame:
     """
     combined = pd.concat(power_dfs, ignore_index=True)
     return combined
+
+
+def wavelet_transform(sws_waves: np.ndarray, low: float = 150, high: float = 350, step_size: float = 0.1, sampling_frequency: float = 1250.0):
+    wavelet = 'cmor1.5-1.0'  # Define the wavelet type
+    frequency = np.arange(start=low, stop=high, step=step_size)  # Define scales for the wavelet transform
+    scales = pywt.frequency2scale(wavelet=wavelet, freq=frequency/sampling_frequency)  # Convert scales to frequencies in Hz
+    wavelet_transform = pywt.cwt(sws_waves, wavelet=wavelet, scales=scales, sampling_period=1/sampling_frequency, method="fft")  # Perform the continuous wavelet transform
+    return wavelet_transform
+
+def get_ripple_power_frequency(sws_waves: np.ndarray, low: float = 150, high: float = 350, step_size: float = 0.1, sampling_frequency: float = 1250.0):
+    wt = wavelet_transform(sws_waves, low=low, high=high, step_size=step_size, sampling_frequency=sampling_frequency)
+    frequency = np.arange(start=low, stop=high, step=step_size)  # Define scales for the wavelet transform
+    wt_abs = np.abs(wt[0])
+    max_vals_freq = wt_abs.max(axis=2)
+    max_frequencies = frequency[max_vals_freq.argmax(axis=0)]  # Frequencies of the maximum wavelet coefficients for each time point
+    max_vals = max_vals_freq.max(axis=0)  # Maximum values of the wavelet coefficients for each time point
+    z_scored_vals = (max_vals - wt_abs.mean(axis=(0,2))) / wt_abs.std(axis=(0,2))
+    time = np.arange(sws_waves.shape[1]) / sampling_frequency * 1000  # Convert time to milliseconds
+    time -= time[len(time) // 2]  # Center the time around zero
+    ripple_peak_time = time[wt_abs.max(axis=0).argmax(axis=1)]
+
+    return {"freq_max": max_frequencies, "power_max": max_vals, "z_score": z_scored_vals, "frequencies": wt[1], "power": wt_abs, "ripple_peak_time": ripple_peak_time}
+
+class SWR:
+    def __init__(self, trace: np.ndarray = np.array([]), time: np.ndarray = np.array([]),
+                sampling_rate: float = 1250, width: float = 100, cut_off_time: float | None = None,
+                high_freq: float = 40, ripple_low: float = 100, ripple_high: float = 250, ripple_order: int = 1) -> None:
+        self.index: np.ndarray = np.array([])
+        self.peak_time: np.ndarray = np.array([])
+        self.peak_amplitude: np.ndarray = np.array([])
+        self.z_scored_power: np.ndarray | None = None
+        self.ripple_frequency: np.ndarray | None = None
+        self.ripple_power: np.ndarray | None = None
+        self.wt_frequencies: np.ndarray | None = None
+        self.wavelet_power: np.ndarray | None = None
+        self.ripple_peak_time: np.ndarray | None = None
+        self.duration: np.ndarray = np.array([])
+        self.sampling_rate: float = sampling_rate
+        self.start_time: float = time[0]
+        self.end_time: float = time[-1]
+        self.cut_off_time: float | None = cut_off_time
+        self.swrs: dict = {}
+        b, a = signal.butter(1, high_freq, btype='low', fs=self.sampling_rate) # pyright: ignore[reportAssignmentType, reportGeneralTypeIssues]
+        self.sharp_wave_trace = lfp_processing(signal.filtfilt(b, a, trace))
+        b, a = band_pass_filter(ripple_low, ripple_high, self.sampling_rate, order=ripple_order)
+        self.ripple_trace = lfp_processing(signal.filtfilt(b, a, trace))
+        self.find_peaks(trace)
+        
+        if cut_off_time is not None:
+            valid_indices = np.where(self.peak_time <= cut_off_time)[0]
+            self.index = self.index[valid_indices]
+            self.peak_time = self.peak_time[valid_indices]
+            self.peak_amplitude = self.peak_amplitude[valid_indices]
+            self.duration = self.duration[valid_indices]
+        if cut_off_time is None or cut_off_time <= self.start_time:
+            cut_off_time = self.end_time
+
+        self.get_cutout(trace, width=width, cut_off_time=cut_off_time)
+
+    def find_peaks(self, trace: np.ndarray) -> None:
+        zscore_sw = stats.zscore(trace, ddof=1)
+        time = np.arange(len(zscore_sw)) / self.sampling_rate + self.start_time
+        peaks, _ = signal.find_peaks(zscore_sw, height=3, distance=self.sampling_rate // 20)
+        self.index = peaks
+        onset = np.array([np.min(t) if len(t)>0 else 0 for t in [np.where(np.flip(zscore_sw[(p-100):p] <= zscore_sw[p]*0.05))[0] if p > 100 else [] for p in peaks]])
+        end = np.array([np.min(t) if len(t)>0 else 0 for t in [np.where(zscore_sw[p:(p+100)] <= zscore_sw[p]*0.05)[0] if p < len(trace) - 100 else [] for p in peaks]])
+        self.duration = (end + onset) / self.sampling_rate * 1000
+        self.peak_time = np.array([time[p] for p in peaks])
+        self.peak_amplitude = np.array([self.sharp_wave_trace["amplitude"][p] for p in peaks])
+
+    def get_cutout(self, trace: np.ndarray, width: float = 100, cut_off_time: float | None = None) -> None:
+        """
+        Get a cutout of the sharp wave ripple data around the peaks.
+        """
+        if self.index is None or len(self.index) == 0:
+            return None
+        if cut_off_time is not None and cut_off_time <= self.start_time:
+            raise ValueError("Cut off time must be greater than the start time of the trace.")
+
+        if cut_off_time is not None and cut_off_time <= self.end_time:
+            index = [i for i in self.index if self.start_time + i / self.sampling_rate <= cut_off_time]
+        else:
+            index = self.index
+        width_int = int(self.sampling_rate * width / 1000) // 2 * 2 +1
+        sws_array = np.full((len(index), width_int), np.nan)
+        ripple_array = np.full((len(index), width_int), np.nan)
+        # Initialize start_idx and end_idx to safe default values
+        start_idx = 0
+        end_idx = width_int - 1 
+        for i, idx in enumerate(index):
+            start_idx = idx - width_int // 2
+            end_idx = idx + width_int // 2 + 1
+            array_offset_start = 0
+            array_offset_end = width_int
+            if start_idx < 0:
+                array_offset_start = -start_idx
+                start_idx = 0
+            if end_idx > len(trace):
+                array_offset_end = width_int - 1 - (end_idx - len(trace))
+                end_idx = len(trace) - 1
+            ripple_array[i, array_offset_start:array_offset_end] = self.ripple_trace["trace"][start_idx:end_idx]
+            sws_array[i, array_offset_start:array_offset_end] = trace[start_idx:end_idx]
+        self.swrs = {"sws": sws_array, "ripple": ripple_array}
+
+    def filter_swrs(self, min_duration: float = 10.0,
+                    max_duration: float | None = None,
+                    min_amplitude: float = 0.001,
+                    max_amplitude: float | None = None,
+                    min_ripple_freq: float = 0,
+                    max_ripple_freq: float | None = None,
+                    z_power: float | None = None,
+                    ripple_peak_time: float | None = None) -> None:
+        if self.swrs is None or len(self.swrs) == 0:
+            raise ValueError("No SWR data available. Cannot filter.")
+
+        valid_indices = np.where((self.duration >= min_duration) & (self.peak_amplitude >= min_amplitude))[0]
+
+        if max_duration is not None:
+            valid_indices = valid_indices[self.duration[valid_indices] <= max_duration]
+        if max_amplitude is not None:
+            valid_indices = valid_indices[self.peak_amplitude[valid_indices] <= max_amplitude]
+        if min_ripple_freq > 0 and self.ripple_frequency is not None:
+            valid_indices = valid_indices[self.ripple_frequency[valid_indices] >= min_ripple_freq]
+        if max_ripple_freq is not None and self.ripple_frequency is not None:
+            valid_indices = valid_indices[self.ripple_frequency[valid_indices] <= max_ripple_freq]
+        if z_power is not None and self.z_scored_power is not None:
+            valid_indices = valid_indices[self.z_scored_power[valid_indices] >= z_power]
+        if ripple_peak_time is not None and self.ripple_peak_time is not None:
+            valid_indices = valid_indices[np.abs(self.ripple_peak_time[valid_indices]) <= ripple_peak_time]
+
+        self.swrs["sws"] = self.swrs["sws"][valid_indices]
+        self.swrs["ripple"] = self.swrs["ripple"][valid_indices]
+        self.index = self.index[valid_indices]
+        self.peak_time = self.peak_time[valid_indices]
+        self.peak_amplitude = self.peak_amplitude[valid_indices]
+        self.duration = self.duration[valid_indices]
+
+        if self.ripple_frequency is not None:
+            self.ripple_frequency = self.ripple_frequency[valid_indices]
+        if self.ripple_power is not None:
+            self.ripple_power = self.ripple_power[valid_indices]
+        if self.wavelet_power is not None:
+            self.wavelet_power = self.wavelet_power[:,valid_indices,:]
+        if self.z_scored_power is not None:
+            self.z_scored_power = self.z_scored_power[valid_indices]
+        if self.ripple_peak_time is not None:
+            self.ripple_peak_time = self.ripple_peak_time[valid_indices]
+
+    def get_ripple_properties(self, low: float = 100, high: float = 350, step_size: float = 0.2) -> None:
+        if self.swrs is None or len(self.swrs) == 0:
+            return None
+        self.ripple_frequency, self.ripple_power, self.z_scored_power, self.wt_frequencies, self.wavelet_power, self.ripple_peak_time = get_ripple_power_frequency(self.swrs["sws"], low=low, high=high, step_size=step_size, sampling_frequency=self.sampling_rate).values()
+
+    def properties_dict(self) -> dict:
+        """
+        Convert the SWR object to a dictionary.
+        """
+        if self.ripple_frequency is None or self.ripple_power is None:
+            ripple_frequency = np.full((len(self.index),), np.nan)
+            ripple_power = np.full((len(self.index),), np.nan)
+            z_scored_power = np.full((len(self.index),), np.nan)
+        else:
+            ripple_frequency = self.ripple_frequency
+            ripple_power = self.ripple_power
+            z_scored_power = self.z_scored_power
+
+        return {
+            "index": self.index,
+            "peak_time": self.peak_time,
+            "peak_amplitude": self.peak_amplitude,
+            "duration": self.duration,
+            "ripple_frequency": ripple_frequency,
+            "ripple_power": ripple_power,
+            "z_scored_power": z_scored_power,
+        }
+
+    def plot(self, return_fig = False, single = False, average = True, show=True, ripple_average = False, title="SWR Traces") -> tuple | None:
+        """
+        Plot the SWR traces.
+        """
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if single:
+            if self.swrs is None or len(self.swrs) == 0:
+                raise ValueError("No SWR data available to plot.")
+            ax.plot(self.swrs["sws"].T, alpha=0.1, color='black')
+        if ripple_average:
+            ax.plot(self.swrs["ripple"].mean(axis=0), alpha=0.6, color='red', label='Average Ripple')
+        if average:
+            ax.plot(self.swrs["sws"].mean(axis=0), alpha=1, color='blue', label='Average SWR')
+        ax.set_title(title)
+        ax.set_xlabel("Time (ms)")
+        ax.set_ylabel("Amplitude (mV)")
+        ax.legend(loc='best')
+        if show:
+            fig_show = deepcopy(fig)   
+            fig_show.show()
+
+        if return_fig:
+            return fig, ax
+        
+    def plot_wt(self, return_fig: bool = False, index: int | None = None, show: bool = True) -> tuple | None:
+        if self.wavelet_power is None or self.wt_frequencies is None:
+            print("No wavelet power data available to plot.")
+            return None
+        elif index is not None and (index < 0 or index >= self.wavelet_power.shape[1]):
+            print("Invalid index for wavelet power data.")
+            return None
+        if index is None:
+            wt = np.mean(self.wavelet_power.mean(axis=1))
+        elif index is not None:
+            wt = self.wavelet_power[:, index, :]
+        else:
+            print("No wavelet power data available to plot.")
+            return None
+
+        time = np.arange(wt.shape[1]) / self.sampling_rate
+        fig, ax = plt.subplots(figsize=(10, 6))
+        power_wt = ax.pcolormesh(time, self.wt_frequencies, wt, shading='gouraud', rasterized=True)  # Plot the wavelet transform
+        plt.colorbar(power_wt, label='Magnitude', ax=ax)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Frequency (Hz)')
+        ax.set_title('Continuous Wavelet Transform')
+        if show:
+            fig_show = deepcopy(fig)
+            fig_show.show()
+        if return_fig:
+            return fig, ax
+        else:
+            return None        
+        
 
 class TraceData:
     def __init__(self, file_name: str, notch: float|None = None, downsampling_frequency: float|None = None) -> None:
@@ -177,7 +415,7 @@ class TraceData:
         b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
         self.gamma_trace = lfp_processing(signal.filtfilt(b, a, self.trace, axis=1))
 
-    def sharp_wave_filter(self, lowcut: float = 5.0, highcut: float = 40.0, order: int = 1):
+    def sharp_wave_filter(self, highcut: float = 40.0, order: int = 1):
         """
         Apply a bandpass filter to the trace data to isolate sharp wave frequencies.
         """
@@ -185,7 +423,9 @@ class TraceData:
             raise ValueError("Trace data or time data is not available. Cannot filter.")
         if self.sampling_rate is None:
             raise ValueError("Sampling rate is not set. Cannot filter.")
-        b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
+        # low pass filter
+        b, a = signal.butter(order, highcut, btype='low')
+        #b, a = band_pass_filter(lowcut, highcut, self.sampling_rate, order=order)
         self.sharp_wave_trace = lfp_processing(signal.filtfilt(b, a, self.trace, axis=1))
         zscore_sw = stats.zscore(self.sharp_wave_trace["amplitude"], axis=1)
         # find peaks in channels with minimum of 50 ms inbetween peaks and minimum height of 3
@@ -195,6 +435,121 @@ class TraceData:
         self.sharp_wave_trace["sws"] = {"index": peaks,
                                         "peak_time": [self.time[p] for p in peaks],
                                         "peak_amplitude": [self.sharp_wave_trace["amplitude"][i][p] for i, p in enumerate(peaks)]}
+
+    def _detect_swr_par(self, high_freq: float = 40.0, width: int = 100, cut_off_time: float | None = None) -> None:
+        """
+        Detect sharp wave ripples (SWR) in the trace data.
+        This method uses parallel processing to speed up the detection.
+        """
+        if self.sampling_rate is None:
+            raise ValueError("Sampling rate is not set. Cannot detect SWR.")
+
+        with Pool() as pool:
+            results = pool.starmap(SWR, [(channel, self.time, self.sampling_rate, width, cut_off_time, high_freq) for channel in self.trace])
+        
+        self.swrs = results
+
+    def _detect_swr(self, high_freq: float = 40, width: int = 100, cut_off_time: float | None = None) -> None:
+        if self.sampling_rate is None:
+            raise ValueError("Sampling rate is not set. Cannot detect SWR.")
+        self.swrs = [SWR(trace=channel, time=self.time, 
+                        sampling_rate=self.sampling_rate,
+                        width=width, cut_off_time=cut_off_time,
+                        high_freq=high_freq) 
+                    for channel in self.trace]
+    
+    def detect_swr(self, high_freq: float = 40.0, width: int = 100, cut_off_time: float | None = None, parallel: bool = True) -> None:
+        """
+        Detect sharp wave ripples (SWR) in the trace data.
+        If parallel is True, use parallel processing to speed up the detection.
+        """
+        if not isinstance(high_freq, (int, float)) or high_freq <= 0:
+            raise ValueError("High frequency must be a positive number.")
+        if not isinstance(width, int) or width <= 0:
+            raise ValueError("Width must be a positive integer.")
+        
+        if parallel:
+            self._detect_swr_par(high_freq=high_freq, width=width, cut_off_time=cut_off_time)
+        else:
+            self._detect_swr(high_freq=high_freq, width=width, cut_off_time=cut_off_time)
+
+    def swrs_wavelet_properties(self, low: float = 150, high: float = 350, step_size: float = 0.2) -> None:
+        if not self.swrs:
+            raise ValueError("No SWRs to analyze.")
+        for swr in self.swrs:
+            if isinstance(swr, SWR):
+                swr.get_ripple_properties(low, high, step_size)
+
+    def filter_swrs(self, min_duration: float = 10.0, max_duration: float | None = None,
+                    min_amplitude: float = 0.001, max_amplitude: float | None = None,
+                    min_ripple_freq: float = 0, max_ripple_freq: float | None = None,
+                    z_power: float | None = None,
+                    ripple_peak_time: float | None = None) -> None:
+        if not self.swrs:
+            raise ValueError("No SWRs to filter.")
+        for swr in self.swrs:
+            if isinstance(swr, SWR):
+                swr.filter_swrs(min_duration, max_duration, min_amplitude, max_amplitude,
+                                min_ripple_freq, max_ripple_freq, z_power=z_power,
+                                ripple_peak_time=ripple_peak_time)
+
+    def get_swr_incidence(self, bin_size: float | None = None, bin: bool = True) -> pd.DataFrame:
+        swr_df = self.swr_summary()
+        if swr_df.empty:
+            raise ValueError("No SWRs to summarize. Cannot calculate incidence.")
+        if bin_size is None and bin:
+            bin_size = swr_df["peak_time"].max() + 0.1
+        if bin_size is None or not bin:
+            swr_df["incidence"] = swr_df.groupby(["Date", "Recording", "File", "Channel"])["peak_time"].diff()
+            return   swr_df[swr_df["incidence"].notna()][["Date", "Recording", "File", "Channel", "peak_time", "incidence"]]
+        if not isinstance(bin_size, (int, float)) or bin_size <= 0:
+            raise ValueError("Bin size must be a positive number.")
+        # also add counts per bin
+        return pd.concat([
+                        channel_df.assign(
+                            time_bin=(channel_df["peak_time"] // bin_size) * bin_size,
+                            incidence=channel_df["peak_time"].diff()
+                        )
+                        .groupby(["time_bin", "Date", "Recording", "File", "Channel"])
+                        .agg(
+                            incidence=("incidence", "mean"),
+                            count=("incidence", "size")
+                        )
+                        .assign(count_per_bin=lambda df: df["count"] / bin_size)
+                        for _, channel_df in swr_df.groupby("Channel")
+                    ])
+
+    def plot_swr_incidence(self) -> None:
+        """
+        Plot the SWR incidence over time for each channel.
+        """
+        incidence_df = self.get_swr_incidence(bin=False)
+        for channel in incidence_df["Channel"].unique():
+            channel_df = incidence_df[incidence_df["Channel"] == channel]
+            plt.plot(channel_df["peak_time"], channel_df["incidence"], label=channel)
+        plt.xlabel("Time (s)")
+        plt.ylabel("SWR Incidence (Hz)")
+        plt.title("SWR Incidence Over Time")
+        plt.legend()
+        plt.show()
+
+    def swr_summary(self) -> pd.DataFrame:
+        """
+        Create a summary DataFrame of SWR properties.
+        """
+        if not self.swrs:
+            raise ValueError("No SWRs to summarize.")
+        summary = []
+        for i, swr in enumerate(self.swrs):
+            if isinstance(swr, SWR):
+                swr_dict = pd.DataFrame(swr.properties_dict())
+                swr_dict["Channel"] = i + 1
+                summary.append(swr_dict)
+        df_out = pd.concat(summary)
+        df_out["Recording"] = self.recording
+        df_out["Date"] = self.date
+        df_out["File"] = self.file_name
+        return df_out
 
     def plot_ripple(self) -> None:
         """
@@ -217,7 +572,7 @@ class TraceData:
         if hasattr(self, 'sharp_wave_trace') and self.sharp_wave_trace is not None and self.time is not None:
             plot_channels(self.sharp_wave_trace, self.time)
 
-    def extract_sws(self, window_size: float = 100.0) -> List[dict]:
+    def extract_sws(self, window_size: float = 100.0, cut_off_time: float = 1800.0) -> List[dict]:
         """
         Extract sharp wave data from the sharp wave trace.
         """
@@ -225,24 +580,43 @@ class TraceData:
             raise ValueError("Sharp wave trace is not available. Cannot extract SWS.")
         if "sws" not in self.sharp_wave_trace:
             raise ValueError("SWS data is not available in the sharp wave trace.")
-        def get_cutout(trace, ripple_trace, index, width):
+        def get_cutout(trace, time, ripple_trace, index, width, cut_off_time=None):
             if hasattr(self, 'sharp_wave_trace') and self.sharp_wave_trace is not None:
                 if "amplitude" not in self.sharp_wave_trace:
                     raise ValueError("Amplitude data is not available in the sharp wave trace.")
                 if len(self.sharp_wave_trace["amplitude"]) == 0:
                     raise ValueError("Amplitude data is empty. Cannot extract SWS.")
-            sws_array = np.zeros((len(index), width-1))
-            ripple_array = np.zeros((len(index), width-1))
+            if (cut_off_time is not None) and (cut_off_time <= time.max()):
+                index = index[time[index] >= cut_off_time]  # Limit time to cut_off_time
+            elif (cut_off_time is not None) and ((cut_off_time > time.max()) or (cut_off_time <= 0)):
+                print(f"Cut off time {cut_off_time} is not valid. Using all data.")
+        
+            sws_array = np.full((len(index), width-1), np.nan)
+            ripple_array = np.full((len(index), width-1), np.nan)
             for i, idx in enumerate(index):
-                sws_array[i] = trace[idx - width // 2: idx + width // 2]
-                ripple_array[i] = ripple_trace[idx - width // 2: idx + width // 2]
+                start_idx = idx - width // 2
+                end_idx = idx + width // 2
+                array_offset_start = 0
+                array_offset_end = width - 1
+                if start_idx < 0:
+                    array_offset_start = -start_idx
+                    start_idx = 0
+                if end_idx > len(trace):
+                    array_offset_end = width - 1 - (end_idx - len(trace))
+                    end_idx = len(trace)
+
+                sws_array[i, array_offset_start:array_offset_end] = trace[start_idx:end_idx]
+                ripple_array[i, array_offset_start:array_offset_end] = ripple_trace[start_idx:end_idx]
             return {"sws": sws_array, "ripple": ripple_array}
         if self.sampling_rate is None:
             raise ValueError("Sampling rate is not set. Cannot extract SWS.")
         width = int(window_size * self.sampling_rate // 1000)  # Convert window size from ms to samples
         if self.ripple_trace is None or "trace" not in self.ripple_trace:
-            raise ValueError("Ripple trace is not available. Cannot extract SWS.")
-        return [get_cutout(self.trace[channel_index], self.ripple_trace["trace"][channel_index], index, width) for channel_index, index in enumerate(self.sharp_wave_trace["sws"]["index"])]
+            print("Ripple trace is not available. Filtering for ripple.")
+            self.ripple_filter()
+            if self.ripple_trace is None or "trace" not in self.ripple_trace:
+                raise ValueError("Filtering failed. Cannot extract SWS.")
+        return [get_cutout(self.trace[channel_index], self.time, self.ripple_trace["trace"][channel_index], index, width, cut_off_time) for channel_index, index in enumerate(self.sharp_wave_trace["sws"]["index"])]
 
     def plot(self) -> None:
         """
@@ -467,11 +841,28 @@ class DataSet:
         for tv in self.trace_data_raw:
             fun(tv)
 
+    def apply_fun_files_list(self, fun):
+        """
+        Apply a function to each file in the smr_files list.
+        """
+        if not hasattr(self, 'smr_files'):
+            raise ValueError("SMR files have not been loaded. Call _get_smr_files() first.")
+        output_list = []
+        bar = Bar('Processing files...', max=len(self.smr_files), suffix='%(percent)d%%')
+        for file_i, file_name in enumerate(self.smr_files):
+            # make progressbar in terminal
+            sys.stdout.write(f"Processing file {file_i + 1}/{len(self.smr_files)}: {file_name}")
+            sys.stdout.flush()
+            output_list.append(fun(file_name))
+            bar.next()
+        bar.finish()
+        return output_list
+
     def power_df_only(self,
                     notch: float | None = 50,
                     downsampling_frequency: float | None = 1250,
-                    window_start: float | None = 0,
-                    window_size: float | None = 60,
+                    window_start: float = 0,
+                    window_size: float = 60,
                     nperseg: int | None = None) -> pd.DataFrame:
         """
         Return only the power DataFrame from the TraceView objects.
